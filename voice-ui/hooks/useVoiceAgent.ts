@@ -73,6 +73,11 @@ export function useVoiceAgent() {
             case "session_started":
                 console.log("[SESSION] Started:", msg.sessionId);
                 break;
+
+            case "error":
+                console.error("[SERVER] Error:", msg.message);
+                // Server also sends a follow-up "state: idle" to reset the avatar.
+                break;
         }
     }, []);
 
@@ -106,8 +111,11 @@ export function useVoiceAgent() {
     }, [isAudioStarted]);
 
     useEffect(() => {
-        // Use production URL if defined, otherwise fallback to localhost for dev
-        const BACKEND_URL = process.env.NEXT_PUBLIC_WS_URL || "wss://ai-voice-qtky.onrender.com";
+        // Production URL comes from NEXT_PUBLIC_WS_URL; falls back to local dev server.
+        const BACKEND_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8080";
+        if (!process.env.NEXT_PUBLIC_WS_URL) {
+            console.warn("[WS] NEXT_PUBLIC_WS_URL is not set; defaulting to ws://localhost:8080 (development only).");
+        }
 
         console.log(`[WS] Connecting to: ${BACKEND_URL}`);
         const ws = new VoiceWebSocket(BACKEND_URL, handleMessage);

@@ -20,6 +20,10 @@ class SessionManager {
     return this.sessions.values();
   }
 
+  getSessionCount() {
+    return this.sessions.size;
+  }
+
   deleteSession(sessionId) {
     this.sessions.delete(sessionId);
   }

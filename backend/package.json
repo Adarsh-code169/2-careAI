@@ -1,13 +1,23 @@
 {
-  "name": "backend",
+  "name": "voice-agent-backend",
   "version": "1.0.0",
-  "description": "",
+  "description": "Real-time streaming voice agent backend (WebSocket gateway, VAD, STT, LLM, TTS)",
   "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test": "node utils/test_vad.js && node utils/test_memory.js"
   },
-  "keywords": [],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "voice-agent",
+    "websocket",
+    "stt",
+    "tts",
+    "llm"
+  ],
   "author": "",
   "license": "ISC",
   "type": "commonjs",

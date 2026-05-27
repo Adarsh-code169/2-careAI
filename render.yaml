@@ -1,0 +1,30 @@
+# Render Blueprint for the Voice Agent backend.
+# Deploy by pointing Render at this repo: New + -> Blueprint.
+# Render injects PORT automatically; do not set it here.
+services:
+  - type: web
+    name: voice-agent-backend
+    runtime: node
+    rootDir: backend
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      # Secrets: leave blank here and fill in via the Render dashboard.
+      - key: DEEPGRAM_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: TAVILY_API_KEY
+        sync: false
+      # Set to your deployed frontend origin, e.g. https://your-app.vercel.app
+      - key: ALLOWED_ORIGINS
+        sync: false
+      # Auto-generated shared secret for the admin context API.
+      - key: ADMIN_TOKEN
+        generateValue: true
+      # Optional: set to https://<this-service>.onrender.com/health to self-ping
+      # and avoid free-tier idle spin-down.
+      - key: SELF_PING_URL
+        sync: false

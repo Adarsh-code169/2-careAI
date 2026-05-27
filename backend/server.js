@@ -1,5 +1,6 @@
 require("dotenv").config();
 const http = require("http");
+const https = require("https");
 const WebSocket = require("ws");
 
 const SessionManager = require("./sessions/SessionManager");
@@ -9,16 +10,57 @@ const { webSearch } = require("./tools/webSearch");
 const { streamTTS } = require("./tts/ttsService");
 const { formatForSpeech } = require("./utils/speechFormatter");
 
-const PORT = 8080;
+// ---- Configuration (env-driven for production) ----
+const PORT = process.env.PORT || 8080;
+const HOST = process.env.HOST || "0.0.0.0";
 const TURN_END_SILENCE_MS = 800;
 const TURN_CHECK_INTERVAL_MS = 200;
 
+// Comma-separated list of allowed browser origins. "*" allows any (dev only).
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "*")
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
+
+// Shared secret protecting the admin context API. If unset, the endpoint is disabled.
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
+
+// Optional keep-alive ping (e.g. Render free tier). Set to the public /health URL.
+const SELF_PING_URL = process.env.SELF_PING_URL || "";
+
+const MAX_ADMIN_BODY_BYTES = 16 * 1024; // 16 KB cap on admin request bodies
+
+// ---- Fail fast on missing required secrets ----
+const REQUIRED_ENV = ["DEEPGRAM_API_KEY", "GROQ_API_KEY", "TAVILY_API_KEY"];
+const missingEnv = REQUIRED_ENV.filter((k) => !process.env[k]);
+if (missingEnv.length > 0) {
+  console.error(
+    `[STARTUP] Missing required environment variables: ${missingEnv.join(", ")}. ` +
+      `Set them in your environment or a .env file (see .env.example).`
+  );
+  process.exit(1);
+}
+
+// Resolve the CORS origin header value for a given request origin.
+function corsOrigin(reqOrigin) {
+  if (ALLOWED_ORIGINS.includes("*")) return "*";
+  if (reqOrigin && ALLOWED_ORIGINS.includes(reqOrigin)) return reqOrigin;
+  return ALLOWED_ORIGINS[0] || "";
+}
+
+// Is a WebSocket/HTTP origin allowed to connect?
+function isOriginAllowed(origin) {
+  if (ALLOWED_ORIGINS.includes("*")) return true;
+  return Boolean(origin) && ALLOWED_ORIGINS.includes(origin);
+}
+
 // 1. Create HTTP Server for Admin API
 const server = http.createServer((req, res) => {
-  // Add CORS headers for all requests
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  // CORS headers (origin restricted via ALLOWED_ORIGINS)
+  res.setHeader("Access-Control-Allow-Origin", corsOrigin(req.headers.origin));
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Admin-Token");
+  res.setHeader("Vary", "Origin");
 
   // Handle preflight OPTIONS request
   if (req.method === "OPTIONS") {
@@ -27,11 +69,43 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Admin API: POST /admin/context
+  // Health Check (JSON with basic readiness info)
+  if (req.method === "GET" && req.url === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      status: "ok",
+      uptimeSec: Math.round(process.uptime()),
+      sessions: sessionManager.getSessionCount(),
+    }));
+    return;
+  }
+
+  // Admin API: POST /admin/context (token-protected)
   if (req.method === "POST" && req.url === "/admin/context") {
+    if (!ADMIN_TOKEN) {
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Admin API disabled (ADMIN_TOKEN not set)" }));
+      return;
+    }
+    if (req.headers["x-admin-token"] !== ADMIN_TOKEN) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unauthorized" }));
+      return;
+    }
+
     let body = "";
-    req.on("data", chunk => { body += chunk.toString(); });
+    let aborted = false;
+    req.on("data", (chunk) => {
+      body += chunk.toString();
+      if (body.length > MAX_ADMIN_BODY_BYTES) {
+        aborted = true;
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Payload too large" }));
+        req.destroy();
+      }
+    });
     req.on("end", () => {
+      if (aborted) return;
       try {
         const { sessionId, content } = JSON.parse(body);
 
@@ -48,7 +122,7 @@ const server = http.createServer((req, res) => {
           return;
         }
 
-        // Apply Context Update Atomicially
+        // Apply Context Update Atomically
         session.dynamicContext = [{ role: "system", content: content.trim() }];
         session.contextVersion++;
         console.log(`[CONTEXT] Session ${session.sessionId}: updated (v${session.contextVersion}) via ADMIN API`);
@@ -64,22 +138,21 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Health Check
-  if (req.url === "/health") {
-    res.writeHead(200);
-    res.end("OK");
-    return;
-  }
-
   res.writeHead(404);
   res.end("Not Found");
 });
 
-// 2. Attach WebSocket Server to HTTP Server
-const wss = new WebSocket.Server({ server });
+// 2. Attach WebSocket Server to HTTP Server (origin-restricted via ALLOWED_ORIGINS)
+const wss = new WebSocket.Server({
+  server,
+  verifyClient: (info, done) => {
+    const origin = info.origin || info.req.headers.origin;
+    if (isOriginAllowed(origin)) return done(true);
+    console.warn(`[WS] Rejected connection from origin: ${origin || "<none>"}`);
+    done(false, 403, "Forbidden origin");
+  },
+});
 const sessionManager = new SessionManager();
-
-console.log(`Voice Agent Server (HTTP + WS) running on :${PORT}`);
 
 /**
  * Intent Gating Logic: Only trigger search for specific, time-sensitive queries.
@@ -248,6 +321,11 @@ Strict Rules:
 
   } catch (err) {
     console.error("[TURN] Failed to process user turn:", err.message);
+    // Never leave the UI stuck on "thinking": surface the error and reset to idle.
+    if (session.ws && session.ws.readyState === 1) {
+      session.ws.send(JSON.stringify({ type: "error", message: "Sorry, I had trouble responding. Please try again." }));
+      session.ws.send(JSON.stringify({ type: "state", value: "idle" }));
+    }
   }
 }
 
@@ -390,11 +468,14 @@ async function finalizeTurn(session) {
 }
 
 // Start Server
-server.listen(PORT, () => {
-  // console.log(`Voice Agent Server running on http://localhost:${PORT}`); -- logged above
+server.listen(PORT, HOST, () => {
+  console.log(`Voice Agent Server (HTTP + WS) listening on ${HOST}:${PORT}`);
+  console.log(`[STARTUP] Allowed origins: ${ALLOWED_ORIGINS.join(", ")}`);
+  console.log(`[STARTUP] Admin API: ${ADMIN_TOKEN ? "enabled (token required)" : "disabled"}`);
 });
 
-setInterval(() => {
+// Turn-end heartbeat: flush turns when audio goes silent without a VAD speech_end.
+const turnHeartbeat = setInterval(() => {
   const now = Date.now();
   for (const session of sessionManager.getAllSessions()) {
     if (
@@ -406,13 +487,49 @@ setInterval(() => {
     }
   }
 }, TURN_CHECK_INTERVAL_MS);
-const https = require("https");
-// Self-ping to keep Render instance alive (every 5 minutes)
-const RENDER_EXTERNAL_URL = "https://ai-voice-qtky.onrender.com/health";
-setInterval(() => {
-  https.get(RENDER_EXTERNAL_URL, (res) => {
-    console.log(`[SELF-PING] Status: ${res.statusCode}`);
-  }).on("error", (err) => {
-    console.log(`[SELF-PING] Failed: ${err.message}`);
+
+// Optional keep-alive self-ping (e.g. to prevent free-tier idle spin-down on Render).
+// Set SELF_PING_URL to your public /health URL to enable.
+let selfPing = null;
+if (SELF_PING_URL) {
+  console.log(`[STARTUP] Self-ping enabled: ${SELF_PING_URL}`);
+  selfPing = setInterval(() => {
+    https.get(SELF_PING_URL, (res) => {
+      console.log(`[SELF-PING] Status: ${res.statusCode}`);
+    }).on("error", (err) => {
+      console.log(`[SELF-PING] Failed: ${err.message}`);
+    });
+  }, 5 * 60 * 1000); // every 5 minutes
+}
+
+// ---- Graceful shutdown (clean redeploys / scale-down) ----
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[SHUTDOWN] Received ${signal}, closing connections...`);
+
+  clearInterval(turnHeartbeat);
+  if (selfPing) clearInterval(selfPing);
+
+  for (const session of sessionManager.getAllSessions()) {
+    try { if (session.sttSocket) session.sttSocket.close(); } catch (e) { }
+    try { if (session.ttsSocket) session.ttsSocket.close(); } catch (e) { }
+    try { if (session.ws) session.ws.close(1001, "Server shutting down"); } catch (e) { }
+  }
+
+  wss.close(() => {
+    server.close(() => {
+      console.log("[SHUTDOWN] Closed cleanly.");
+      process.exit(0);
+    });
   });
-}, 300000); // 5 minutes (300,000 ms)
+
+  // Force-exit if connections don't drain in time.
+  setTimeout(() => {
+    console.warn("[SHUTDOWN] Force exit after timeout.");
+    process.exit(1);
+  }, 10000).unref();
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));

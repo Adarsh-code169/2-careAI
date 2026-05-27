@@ -8,9 +8,10 @@ export interface TranscriptMessage {
 }
 
 export interface WebSocketMessage {
-    type: "state" | "transcript_user" | "transcript_assistant" | "barge_in" | "session_started" | "tts_audio_full" | "tts_complete" | "metrics";
+    type: "state" | "transcript_user" | "transcript_assistant" | "barge_in" | "session_started" | "tts_audio_full" | "tts_complete" | "metrics" | "error";
     value?: AgentState;
     text?: string;
+    message?: string;
     sessionId?: string;
     payload?: any;
     requestId?: number;
@@ -30,6 +31,10 @@ export class VoiceWebSocket {
     private ws: WebSocket | null = null;
     private url: string;
     private onMessage: (msg: WebSocketMessage) => void;
+    private reconnectAttempts = 0;
+    private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    private closedByUser = false;
+    private static readonly MAX_RECONNECT_DELAY_MS = 30000;
 
     constructor(url: string, onMessage: (msg: WebSocketMessage) => void) {
         this.url = url;
@@ -37,15 +42,17 @@ export class VoiceWebSocket {
     }
 
     connect() {
+        this.closedByUser = false;
         this.ws = new WebSocket(this.url);
 
         this.ws.onopen = () => {
             console.log("[WS] Connected to voice server");
+            this.reconnectAttempts = 0;
         };
 
         this.ws.onmessage = (event) => {
             try {
-                // Ignore binary messages for parsing (they are for audio incoming if we used binary, 
+                // Ignore binary messages for parsing (they are for audio incoming if we used binary,
                 // but here backend sends base64 JSON for TTS)
                 if (typeof event.data !== 'string') return;
 
@@ -57,8 +64,15 @@ export class VoiceWebSocket {
         };
 
         this.ws.onclose = () => {
-            console.log("[WS] Disconnected. Retrying in 3s...");
-            setTimeout(() => this.connect(), 3000);
+            if (this.closedByUser) return;
+            // Exponential backoff, capped, so a downed server isn't hammered.
+            const delay = Math.min(
+                1000 * 2 ** this.reconnectAttempts,
+                VoiceWebSocket.MAX_RECONNECT_DELAY_MS
+            );
+            this.reconnectAttempts++;
+            console.log(`[WS] Disconnected. Reconnecting in ${Math.round(delay / 1000)}s (attempt ${this.reconnectAttempts})...`);
+            this.reconnectTimer = setTimeout(() => this.connect(), delay);
         };
 
         this.ws.onerror = (err) => {
@@ -79,6 +93,11 @@ export class VoiceWebSocket {
     }
 
     close() {
+        this.closedByUser = true;
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
         if (this.ws) {
             this.ws.close();
         }

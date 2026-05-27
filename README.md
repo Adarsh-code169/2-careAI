@@ -86,29 +86,29 @@ Each stage is isolated, observable, and instrumented for latency and correctness
 
 ### STT Stability Improvements
 - Turn-final buffering (no partial-word commits)
-- Confidence-based validation
-- Clarification prompts on ambiguous or low-confidence transcripts
+- Transcript cleaning to drop spurious/short fragments
+- Downstream logic runs only on final transcripts
 
-### STT Fallback
-- Fallback Provider: AssemblyAI (HTTP, final transcript only)
-- Triggered on connection failure, timeout, or provider errors
+### STT Resilience
+- Always-on Deepgram socket, re-created per session
+- Connection/parse errors are caught and logged with the `sessionId`
+- A turn-end heartbeat flushes the turn if audio goes silent without a VAD `speech_end`
 
 ---
 
 ## LLM Processing
-- Primary Provider: Groq (fast inference)
-- Secondary Provider: Groq (separate API key for fallback simulation)
+- Provider: Groq (fast inference, `llama-3.3-70b-versatile`)
+- Two-call flow per turn: a search-decision call, then a grounded-response call
 
 ### Features
-- Session-scoped conversation memory (bounded sliding window)
-- Tool-based reasoning for web search
+- Session-scoped conversation memory (bounded sliding window of the last 12 messages)
+- Intent-gated web search (decision call + explicit keyword gate)
 - Prompting optimized for spoken, human-like responses (not bullet points)
 - Numerical and temperature responses formatted for natural speech
 
-### LLM Fallback
-- Automatic fallback on rate limits, timeouts, or network failures
-- Transparent to the user
-- Logged and surfaced in metrics
+### LLM Resilience
+- Errors (rate limits, timeouts, network failures) are caught per turn
+- On failure the user hears a short apology and the UI resets to idle — it never hangs on "thinking"
 
 ---
 
@@ -133,9 +133,10 @@ Each stage is isolated, observable, and instrumented for latency and correctness
 - Playback buffer cleared
 - New user speech is captured without delay
 
-### TTS Fallback
-- Secondary Provider: Cartesia (HTTP synthesis)
-- Triggered if streaming TTS fails to start or stalls
+### TTS Resilience
+- Per-sentence synthesis with automatic retry and exponential backoff (up to 3 attempts)
+- Keep-alive HTTPS agent and per-request timeouts to avoid socket hang-ups
+- Request-ID guarding so audio from a barged-in turn is never played
 
 ---
 
@@ -180,15 +181,12 @@ Metrics are displayed live in the UI sidebar and logged structurally.
 
 ---
 
-## Structured Logging
-- JSON logs with correlation IDs
-- Each log includes:
-  - sessionId
-  - turnId
-  - pipeline stage
-  - timestamp
+## Logging
+- Stage-tagged console logs (e.g. `[STT]`, `[SEARCH]`, `[LLM RESPONSE]`, `[TTS]`)
+- Most log lines include the `sessionId`, and turn metrics carry a `turnId`
+- This makes it possible to follow a single user utterance through the pipeline in the logs
 
-This allows tracing a single user utterance end-to-end across the system.
+> Note: logs are human-readable tagged lines, not JSON. Structured JSON logging is a candidate future improvement.
 
 ---
 
@@ -204,11 +202,10 @@ This allows tracing a single user utterance end-to-end across the system.
 ---
 
 ## Testing & Verification
-- Manual testing with multiple concurrent browser tabs
-- Admin scripts for:
-  - Live context injection
-  - Session targeting
-  - Simulated provider failures to verify fallback logic
+- Unit/integration scripts under `backend/utils/` (VAD, memory bounding, search gating, STT stability)
+  — run a couple via `npm test` in `backend/`
+- Manual testing with multiple concurrent browser tabs (verifies session isolation)
+- The token-protected admin API (`POST /admin/context`) for live, session-targeted context injection
 
 ---
 
@@ -302,22 +299,25 @@ This project went through multiple iterations while solving real, production-sty
 
 ---
 
-### 5. Provider Choice & Fallback Strategy
+### 5. Provider Choice & Resilience Strategy
 
-**Initial approach:**
-- Single provider per capability
+**Approach:**
+- One focused provider per capability: Deepgram (STT + TTS), Groq (LLM), Tavily (search)
 
 **Problems encountered:**
-- Rate limits during barge-in
-- Hard failures blocking the pipeline
+- Transient timeouts and socket hang-ups, especially on TTS during rapid barge-in
 
 **Final decision:**
-- Explicit fallback layers for STT, LLM, and TTS
-- Secondary Groq key used to simulate provider isolation
+- Per-request timeouts, retry with exponential backoff (TTS), and a keep-alive HTTPS agent
+- Every stage catches its own errors; a failed turn resets the UI to idle instead of hanging
 
 **Tradeoff:**
-- Slightly more configuration
-- High resilience and production realism
+- No automatic cross-provider failover (a hard provider outage degrades that capability)
+- In exchange: far simpler, more debuggable orchestration and fewer moving parts
+
+> Multi-provider failover (e.g. a second STT/TTS/LLM vendor) was intentionally scoped out to
+> keep the pipeline simple and honest. It's a natural extension behind the existing service
+> interfaces if higher availability is needed.
 
 ---
 
@@ -344,33 +344,58 @@ This iterative process reflects real-world engineering tradeoffs rather than ide
 ### Prerequisites
 - Node.js (v18+ recommended)
 - Modern browser (Chrome preferred)
+- API keys: Deepgram, Groq, Tavily
 
-### Installation
+### 1. Backend
 
 ```bash
-git clone <repo-url>
 cd backend
 npm install
+cp .env.example .env   # then fill in your keys
+npm start              # serves HTTP + WebSocket on :8080
 ```
 
-### Environment Variables
-
-Create a .env file based on .env.example:
+Required environment variables (see `backend/.env.example` for the full list):
 
 ```
-DEEPGRAM_API_KEY=
-GROQ_API_KEY_PRIMARY=
-GROQ_API_KEY_SECONDARY=
-TAVILY_API_KEY=
+DEEPGRAM_API_KEY=      # STT + TTS
+GROQ_API_KEY=          # LLM
+TAVILY_API_KEY=        # web search
 ```
 
-### Run Locally
+Optional (recommended for production):
+
+```
+ALLOWED_ORIGINS=       # comma-separated allowed browser origins ("*" = dev only)
+ADMIN_TOKEN=           # shared secret for POST /admin/context (disabled if unset)
+SELF_PING_URL=         # public /health URL for free-tier keep-alive
+PORT=                  # injected by the host; defaults to 8080 locally
+```
+
+### 2. Frontend
 
 ```bash
-node server.js
+cd voice-ui
+npm install
+cp .env.example .env.local   # defaults to ws://localhost:8080
+npm run dev                  # http://localhost:3000
 ```
 
-Open the frontend and start a voice session.
+Set `NEXT_PUBLIC_WS_URL` to point the UI at the backend (defaults to `ws://localhost:8080`).
+
+Open http://localhost:3000, click to grant microphone access, and start talking.
+
+---
+
+## Deployment
+
+The backend (long-lived WebSocket server) and frontend (Next.js) deploy separately:
+
+- **Backend → Render** (a `render.yaml` Blueprint is included at the repo root)
+- **Frontend → Vercel**
+
+See **[DEPLOYMENT.md](./DEPLOYMENT.md)** for complete, step-by-step instructions including
+environment variables, CORS/origin wiring, and end-to-end verification.
 
 ---
 
